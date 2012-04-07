@@ -15,7 +15,7 @@ The deriving code for the Generic class
 
 
 module TcGenGenerics (canDoGenerics, GenericKind(..), DeriveGeneric(..),
-                      gen_Generic_binds) where
+                      gen_Generic_binds, get_gen1_constrained_tys) where
 
 
 import DynFlags
@@ -325,19 +325,17 @@ tc_mkRepFamInsts gk tycon metaDts mod =
 --------------------------------------------------------------------------------
 
 data ArgTyAlg a = ArgTyAlg
- { ata_par0 :: (Type -> a)
- , ata_rec0 :: (Type -> a)
- , ata_par1 :: a
- , ata_rec1 :: (Type -> a)
- , ata_comp :: (Type -> a -> a)
- }
+  { ata_par0 :: (Type -> a), ata_rec0 :: (Type -> a)
+  , ata_par1 :: a, ata_rec1 :: (Type -> a)
+  , ata_comp :: (Type -> a -> a)
+  }
 
 -- | Interpret a type (as an argument to a data constructor) based on that
 -- type's Generic structure. (Figure 3 from <http://dreixel.net/research/pdf/gdmh.pdf>)
-argTyFold :: ArgTyAlg a -> Var -> Type -> a
-argTyFold (ArgTyAlg {ata_par1 = mkPar1, ata_par0 = mkPar0,
-                     ata_rec1 = mkRec1, ata_comp = mkComp, ata_rec0 = mkRec0})
-  argVar = go1 where
+argTyFold :: TyVar -> ArgTyAlg a -> Type -> a
+argTyFold argVar (ArgTyAlg {ata_par0 = mkPar0, ata_rec0 = mkRec0,
+                            ata_par1 = mkPar1, ata_rec1 = mkRec1,
+                            ata_comp = mkComp}) = go1 where
   -- First check if the argument is a parameter.
   go1 t = case getTyVar_maybe t of
     Just t' -> if (t' == argVar)
@@ -371,6 +369,12 @@ argTyFold (ArgTyAlg {ata_par1 = mkPar1, ata_par0 = mkPar0,
         -- Ok, I don't recognize it as anything special, so I use Rec0.
     _ -> mkRec0 t  -- gdmh.pdf, Figure 3, arg case 5
 
+
+get_gen1_constrained_tys :: TyVar -> [Type] -> [Type]
+get_gen1_constrained_tys argVar = concatMap $
+  argTyFold argVar $ ArgTyAlg {ata_par0 = const [], ata_rec0 = const [],
+                               ata_par1 = [], ata_rec1 = const [],
+                               ata_comp = (:)}
 
 
 
@@ -443,9 +447,9 @@ tc_mkRepTy gk tycon metaDts =
             argPar =
               let argVar = ASSERT (length (tyConTyVars tycon) >= 1)
                            last (tyConTyVars tycon)
-              in argTyFold (ArgTyAlg {ata_par0 = mkPar0, ata_rec0 = mkRec0,
-                                      ata_par1 = mkPar1, ata_rec1 = mkRec1,
-                                      ata_comp = mkComp}) argVar
+              in argTyFold argVar $ ArgTyAlg
+                   {ata_par0 = mkPar0, ata_rec0 = mkRec0, ata_par1 = mkPar1,
+                    ata_rec1 = mkRec1, ata_comp = mkComp}
         
        
         metaDTyCon  = mkTyConTy (metaD metaDts)
@@ -578,12 +582,12 @@ mk1Sum gk_ us i n datacon = (from_alt, to_alt)
       Gen0_        -> nlHsVarApps datacon_rdr datacon_vars
       Gen1_ argVar -> nlHsApps datacon_rdr $ map argTo datacon_varTys
         where
-          argTo (var, ty) = (\f -> f argVar ty `nlHsApp` nlHsVar var) $ argTyFold $ ArgTyAlg
-            {ata_par0 = const $ nlHsVar unK1_RDR,
-             ata_rec0 = const $ nlHsVar unK1_RDR,
-             ata_par1 = nlHsVar unPar1_RDR,
-             ata_rec1 = const $ nlHsVar unRec1_RDR,
-             ata_comp = \_ cnv -> (nlHsVar fmap_RDR `nlHsApp` cnv) `nlHsCompose` nlHsVar unComp1_RDR }
+          argTo (var, ty) = (\f -> f ty `nlHsApp` nlHsVar var) $ argTyFold argVar $
+            ArgTyAlg
+            {ata_par0 = const $ nlHsVar unK1_RDR, ata_rec0 = const $ nlHsVar unK1_RDR,
+             ata_par1 = nlHsVar unPar1_RDR, ata_rec1 = const $ nlHsVar unRec1_RDR,
+             ata_comp = \_ cnv -> (nlHsVar fmap_RDR `nlHsApp` cnv) `nlHsCompose`
+                                  nlHsVar unComp1_RDR }
 
 
 
@@ -626,12 +630,11 @@ wrapArg_E Gen0_          (var, _)  = mkM1_E (k1DataCon_RDR `nlHsVarApps` [var])
                          -- This M1 is meta-information for the selector
 wrapArg_E (Gen1_ argVar) (var, ty) = mkM1_E $
                          -- This M1 is meta-information for the selector
-  (\f -> f argVar ty `nlHsApp` nlHsVar var) $ argTyFold $ ArgTyAlg
-  {ata_par0 = const $ nlHsVar k1DataCon_RDR,
-   ata_rec0 = const $ nlHsVar k1DataCon_RDR,
-   ata_par1 = nlHsVar par1DataCon_RDR,
-   ata_rec1 = const $ nlHsVar rec1DataCon_RDR,
-   ata_comp = \_ cnv -> nlHsVar comp1DataCon_RDR `nlHsCompose` (nlHsVar fmap_RDR `nlHsApp` cnv) }
+  (\f -> f ty `nlHsApp` nlHsVar var) $ argTyFold argVar $ ArgTyAlg
+  {ata_par0 = const $ nlHsVar k1DataCon_RDR, ata_rec0 = const $ nlHsVar k1DataCon_RDR,
+   ata_par1 = nlHsVar par1DataCon_RDR, ata_rec1 = const $ nlHsVar rec1DataCon_RDR,
+   ata_comp = \_ cnv -> nlHsVar comp1DataCon_RDR `nlHsCompose`
+                        (nlHsVar fmap_RDR `nlHsApp` cnv) }
 
 
 

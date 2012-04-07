@@ -334,10 +334,6 @@ tcDeriving tycl_decls inst_decls deriv_decls
         ; let (binds, newTyCons, famInsts, extraInstances) = 
                 genAuxBinds loc (unionManyBags deriv_stuff)
 
-	; dflags <- getDynFlags
-	; liftIO (dumpIfSet_dyn dflags Opt_D_dump_deriv "Derived instances"
-	         (ddump_deriving' inst_infos binds newTyCons famInsts))
-
         ; (inst_info, rn_binds, rn_dus) <-
             renameDeriv is_boot (inst_infos ++ (bagToList extraInstances)) binds
 
@@ -369,20 +365,7 @@ tcDeriving tycl_decls inst_decls deriv_decls
 
     hangP s x = text "" $$ hang (ptext (sLit s)) 2 x
 
-    ddump_deriving' :: [InstInfo RdrName] -> Bag (LHsBind RdrName, LSig RdrName)
-                   -> Bag TyCon    -- ^ Empty data constructors
-                   -> Bag FamInst  -- ^ Rep type family instances
-                   -> SDoc
-    ddump_deriving' inst_infos extra_binds repMetaTys repFamInsts
-      =    hang (ptext (sLit "Derived instances:"))
-              2 (vcat (map (\i -> pprInstInfoDetails i $$ text "") inst_infos)
-                 $$ let (bs, sigs) = unzip $ bagToList extra_binds
-                    in ppr sigs $$ ppr bs)
-        $$ hangP "Generic representation:" (
-              hangP "Generated datatypes for meta-information:"
-               (vcat (map ppr (bagToList repMetaTys)))
-           $$ hangP "Representation types:"
-                (vcat (map pprRepTy (bagToList repFamInsts))))
+
 
 -- Prints the representable type family instance
 pprRepTy :: FamInst -> SDoc
@@ -726,8 +709,9 @@ mk_data_eqn :: CtOrigin -> [TyVar] -> Class
 mk_data_eqn orig tvs cls tycon tc_args rep_tc rep_tc_args mtheta
   = do	{ dfun_name <- new_dfun_name cls tycon
   	; loc <- getSrcSpanM
+        ; functorClass <- tcLookupClass functorClassName
 	; let inst_tys = [mkTyConApp tycon tc_args]
-	      inferred_constraints = inferConstraints tvs cls inst_tys rep_tc rep_tc_args
+	      inferred_constraints = inferConstraints functorClass tvs cls inst_tys rep_tc rep_tc_args
 	      spec = DS { ds_loc = loc, ds_orig = orig
 			, ds_name = dfun_name, ds_tvs = tvs
 			, ds_cls = cls, ds_tys = inst_tys
@@ -771,23 +755,28 @@ mk_typeable_eqn orig tvs cls tycon tc_args mtheta
 		     , ds_theta = mtheta `orElse` [], ds_newtype = False })  }
 
 ----------------------
-inferConstraints :: [TyVar] -> Class -> [TcType] -> TyCon -> [TcType] -> ThetaType
+inferConstraints :: Class -> -- the Functor class
+                    [TyVar] -> Class -> [TcType] -> TyCon -> [TcType] -> ThetaType
 -- Generate a sufficiently large set of constraints that typechecking the
 -- generated method definitions should succeed.   This set will be simplified
 -- before being used in the instance declaration
-inferConstraints _ cls inst_tys rep_tc rep_tc_args
+inferConstraints functorClass _ cls inst_tys rep_tc rep_tc_args
   -- Generic constraints are easy
   | cls `hasKey` genClassKey
   = []
+  | cls `hasKey` gen1ClassKey
+  = ASSERT (length rep_tc_tvs > 0)
+    con_arg_constraints functorClass (get_gen1_constrained_tys last_tv) 
   -- The others are a bit more complicated
   | otherwise
   = ASSERT2( equalLength rep_tc_tvs all_rep_tc_args, ppr cls <+> ppr rep_tc )
     stupid_constraints ++ extra_constraints
-    ++ sc_constraints ++ con_arg_constraints
+    ++ sc_constraints
+    ++ con_arg_constraints cls get_std_constrained_tys
   where
        -- Constraints arising from the arguments of each constructor
-    con_arg_constraints
-      = [ mkClassPred cls [arg_ty]
+    con_arg_constraints cls' get_constrained_tys
+      = [ mkClassPred cls' [arg_ty]
         | data_con <- tyConDataCons rep_tc,
           arg_ty   <- ASSERT( isVanillaDataCon data_con )
     			get_constrained_tys $
@@ -802,14 +791,15 @@ inferConstraints _ cls inst_tys rep_tc rep_tc_args
     		-- (b) The rep_tc_args will be one short
     is_functor_like = getUnique cls `elem` functorLikeClassKeys
 
-    get_constrained_tys :: [Type] -> [Type]
-    get_constrained_tys tys
+    get_std_constrained_tys :: [Type] -> [Type]
+    get_std_constrained_tys tys
         | is_functor_like = concatMap (deepSubtypesContaining last_tv) tys
     	| otherwise	  = tys
 
     rep_tc_tvs = tyConTyVars rep_tc
     last_tv = last rep_tc_tvs
-    all_rep_tc_args | is_functor_like = rep_tc_args ++ [mkTyVarTy last_tv]
+    all_rep_tc_args | cls `hasKey` gen1ClassKey || is_functor_like
+                      = rep_tc_args ++ [mkTyVarTy last_tv]
     		    | otherwise       = rep_tc_args
 
     	-- Constraints arising from superclasses
@@ -1097,11 +1087,11 @@ std_class_via_iso clas
 
 
 non_iso_class :: Class -> Bool
--- *Never* derive Read, Show, Typeable, Data, Generic by isomorphism,
+-- *Never* derive Read, Show, Typeable, Data, Generic, Generic1 by isomorphism,
 -- even with -XGeneralizedNewtypeDeriving
 non_iso_class cls
   = classKey cls `elem` ([ readClassKey, showClassKey, dataClassKey
-                         , genClassKey] ++ typeableClassKeys)
+                         , genClassKey, gen1ClassKey] ++ typeableClassKeys)
 
 typeableClassKeys :: [Unique]
 typeableClassKeys = map getUnique typeableClassNames
@@ -1533,7 +1523,7 @@ genDerivStuff loc fix_env clas name tycon
   = return (gen_Typeable_binds loc tycon, emptyBag)
 
   | ck `elem` [genClassKey, gen1ClassKey]   -- Special case because monadic
-  = let dg = One $ if ck == genClassKey then Gen0 else Gen1
+  = let dg = One $ if ck == genClassKey then Gen0 else Gen1 -- TODO NSF: correctly identify when we're building Both instead of One
     in gen_Generic_binds dg tycon (nameModule name)
 
   | otherwise	                   -- Non-monadic generators
