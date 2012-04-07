@@ -13,7 +13,9 @@ Handles @deriving@ clauses on @data@ declarations.
 --     http://hackage.haskell.org/trac/ghc/wiki/Commentary/CodingStyle#TabsvsSpaces
 -- for details
 
-module TcDeriv ( tcDeriving ) where
+module TcDeriv ( tcDeriving
+               -- We use cond_functorOK in Generics.lhs                                                                                                                                                 
+               , cond_functorOK_tc ) where
 
 #include "HsVersions.h"
 
@@ -320,6 +322,8 @@ tcDeriving tycl_decls inst_decls deriv_decls
 	; let (infer_specs, given_specs) = splitEithers early_specs
 	; insts1 <- mapM (genInst True overlap_flag) given_specs
 
+        -- the stand-alone derived instances (@insts1@) are used when inferring
+        -- the contexts for "deriving" clauses' instances (@infer_specs@)
 	; final_specs <- extendLocalInstEnv (map (iSpec . fst) insts1) $
                            inferInstanceContexts overlap_flag infer_specs
 
@@ -329,6 +333,11 @@ tcDeriving tycl_decls inst_decls deriv_decls
         ; loc <- getSrcSpanM
         ; let (binds, newTyCons, famInsts, extraInstances) = 
                 genAuxBinds loc (unionManyBags deriv_stuff)
+
+	; dflags <- getDynFlags
+	; liftIO (dumpIfSet_dyn dflags Opt_D_dump_deriv "Derived instances"
+	         (ddump_deriving' inst_infos binds newTyCons famInsts))
+
         ; (inst_info, rn_binds, rn_dus) <-
             renameDeriv is_boot (inst_infos ++ (bagToList extraInstances)) binds
 
@@ -359,6 +368,21 @@ tcDeriving tycl_decls inst_decls deriv_decls
                 (vcat (map pprRepTy (bagToList repFamInsts))))
 
     hangP s x = text "" $$ hang (ptext (sLit s)) 2 x
+
+    ddump_deriving' :: [InstInfo RdrName] -> Bag (LHsBind RdrName, LSig RdrName)
+                   -> Bag TyCon    -- ^ Empty data constructors
+                   -> Bag FamInst  -- ^ Rep type family instances
+                   -> SDoc
+    ddump_deriving' inst_infos extra_binds repMetaTys repFamInsts
+      =    hang (ptext (sLit "Derived instances:"))
+              2 (vcat (map (\i -> pprInstInfoDetails i $$ text "") inst_infos)
+                 $$ let (bs, sigs) = unzip $ bagToList extra_binds
+                    in ppr sigs $$ ppr bs)
+        $$ hangP "Generic representation:" (
+              hangP "Generated datatypes for meta-information:"
+               (vcat (map ppr (bagToList repMetaTys)))
+           $$ hangP "Representation types:"
+                (vcat (map pprRepTy (bagToList repFamInsts))))
 
 -- Prints the representable type family instance
 pprRepTy :: FamInst -> SDoc
@@ -879,6 +903,8 @@ sideConditions mtheta cls
     	                                   cond_functorOK False)
   | cls_key == genClassKey         = Just (cond_RepresentableOk `andCond`
                                            checkFlag Opt_DeriveGeneric)
+  | cls_key == gen1ClassKey        = Just (cond_Representable1Ok `andCond`
+                                           checkFlag Opt_DeriveGeneric)
   | otherwise = Nothing
   where
     cls_key = getUnique cls
@@ -931,6 +957,9 @@ no_cons_why rep_tc = quotes (pprSourceTyCon rep_tc) <+>
 
 cond_RepresentableOk :: Condition
 cond_RepresentableOk (_,t) = canDoGenerics t
+
+cond_Representable1Ok :: Condition
+cond_Representable1Ok = cond_RepresentableOk `andCond` cond_functorOK True
 
 cond_enumOrProduct :: Class -> Condition
 cond_enumOrProduct cls = cond_isEnumeration `orCond`
@@ -998,13 +1027,16 @@ functorLikeClassKeys :: [Unique]
 functorLikeClassKeys = [functorClassKey, foldableClassKey, traversableClassKey]
 
 cond_functorOK :: Bool -> Condition
+cond_functorOK b = cond_functorOK_tc b . snd
+
+cond_functorOK_tc :: Bool -> TyCon -> Maybe SDoc
 -- OK for Functor/Foldable/Traversable class
 -- Currently: (a) at least one argument
 --            (b) don't use argument contravariantly
 --            (c) don't use argument in the wrong place, e.g. data T a = T (X a a)
 --            (d) optionally: don't use function types
 --            (e) no "stupid context" on data type
-cond_functorOK allowFunctions (_, rep_tc)
+cond_functorOK_tc allowFunctions rep_tc
   | null tc_tvs
   = Just (ptext (sLit "Data type") <+> quotes (ppr rep_tc)
           <+> ptext (sLit "must have some type parameters"))
@@ -1500,14 +1532,17 @@ genDerivStuff loc fix_env clas name tycon
   | className clas `elem` typeableClassNames
   = return (gen_Typeable_binds loc tycon, emptyBag)
 
-  | classKey clas == genClassKey   -- Special case because monadic
-  = gen_Generic_binds tycon (nameModule name)
+  | ck `elem` [genClassKey, gen1ClassKey]   -- Special case because monadic
+  = let dg = One $ if ck == genClassKey then Gen0 else Gen1
+    in gen_Generic_binds dg tycon (nameModule name)
 
   | otherwise	                   -- Non-monadic generators
   = case assocMaybe gen_list (getUnique clas) of
         Just gen_fn -> return (gen_fn loc tycon)
         Nothing	    -> pprPanic "genDerivStuff: bad derived class" (ppr clas)
   where
+    ck = classKey clas
+
     gen_list :: [(Unique, SrcSpan -> TyCon -> (LHsBinds RdrName, BagDerivStuff))]
     gen_list = [(eqClassKey,            gen_Eq_binds)
                ,(ordClassKey,           gen_Ord_binds)
@@ -1520,7 +1555,7 @@ genDerivStuff loc fix_env clas name tycon
                ,(functorClassKey,       gen_Functor_binds)
                ,(foldableClassKey,      gen_Foldable_binds)
                ,(traversableClassKey,   gen_Traversable_binds)
-               ]
+                ]
 \end{code}
 
 %************************************************************************

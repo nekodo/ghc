@@ -1,0 +1,11 @@
+
+\begin{code}
+
+module TcDeriv where
+
+import TyCon
+import Outputable
+
+cond_functorOK_tc :: Bool -> TyCon -> Maybe SDoc
+
+\end{code}

@@ -616,8 +616,10 @@ error_RDR = varQual_RDR gHC_ERR (fsLit "error")
 -- Generics (constructors and functions)
 u1DataCon_RDR, par1DataCon_RDR, rec1DataCon_RDR,
   k1DataCon_RDR, m1DataCon_RDR, l1DataCon_RDR, r1DataCon_RDR,
-  prodDataCon_RDR, comp1DataCon_RDR, from_RDR, from1_RDR,
-  to_RDR, to1_RDR, datatypeName_RDR, moduleName_RDR, conName_RDR,
+  prodDataCon_RDR, comp1DataCon_RDR,
+  unPar1_RDR, unRec1_RDR, unK1_RDR, unComp1_RDR,
+  from_RDR, from1_RDR, to_RDR, to1_RDR,
+  datatypeName_RDR, moduleName_RDR, conName_RDR,
   conFixity_RDR, conIsRecord_RDR,
   noArityDataCon_RDR, arityDataCon_RDR, selName_RDR,
   prefixDataCon_RDR, infixDataCon_RDR, leftAssocDataCon_RDR,
@@ -634,6 +636,11 @@ r1DataCon_RDR     = dataQual_RDR gHC_GENERICS (fsLit "R1")
 
 prodDataCon_RDR   = dataQual_RDR gHC_GENERICS (fsLit ":*:")
 comp1DataCon_RDR  = dataQual_RDR gHC_GENERICS (fsLit "Comp1")
+
+unPar1_RDR  = varQual_RDR gHC_GENERICS (fsLit "unPar1")
+unRec1_RDR  = varQual_RDR gHC_GENERICS (fsLit "unRec1")
+unK1_RDR    = varQual_RDR gHC_GENERICS (fsLit "unK1")
+unComp1_RDR = varQual_RDR gHC_GENERICS (fsLit "unComp1")
 
 from_RDR  = varQual_RDR gHC_GENERICS (fsLit "from")
 from1_RDR = varQual_RDR gHC_GENERICS (fsLit "from1")
