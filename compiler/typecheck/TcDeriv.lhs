@@ -709,9 +709,9 @@ mk_data_eqn :: CtOrigin -> [TyVar] -> Class
 mk_data_eqn orig tvs cls tycon tc_args rep_tc rep_tc_args mtheta
   = do	{ dfun_name <- new_dfun_name cls tycon
   	; loc <- getSrcSpanM
-        -- TODO NSF 9 April 2012: only recover from a
+        -- TODO NSF 9 April 2012: only recover from the anticipated
         -- "base:Data.Functor.Functor could not be found" error
-        ; functorClass_maybe <- recoverM (return Nothing) $ Just `fmap` tcLookupClass functorClassName
+        ; (_, functorClass_maybe) <- tryTc $ tcLookupClass functorClassName
 	; let inst_tys = [mkTyConApp tycon tc_args]
 	      inferred_constraints = inferConstraints functorClass_maybe tvs cls inst_tys rep_tc rep_tc_args
 	      spec = DS { ds_loc = loc, ds_orig = orig
