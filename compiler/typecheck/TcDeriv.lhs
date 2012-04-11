@@ -13,9 +13,7 @@ Handles @deriving@ clauses on @data@ declarations.
 --     http://hackage.haskell.org/trac/ghc/wiki/Commentary/CodingStyle#TabsvsSpaces
 -- for details
 
-module TcDeriv ( tcDeriving
-               -- We use cond_functorOK in Generics.lhs                                                                                                                                                 
-               , cond_functorOK_tc ) where
+module TcDeriv ( tcDeriving ) where
 
 #include "HsVersions.h"
 
@@ -896,7 +894,8 @@ sideConditions mtheta cls
     	                                   cond_functorOK False)
   | cls_key == genClassKey         = Just (cond_RepresentableOk `andCond`
                                            checkFlag Opt_DeriveGeneric)
-  | cls_key == gen1ClassKey        = Just (cond_Representable1Ok `andCond`
+  | cls_key == gen1ClassKey        = Just (cond_RepresentableOk `andCond`
+                                           cond_Representable1Ok `andCond`
                                            checkFlag Opt_DeriveGeneric)
   | otherwise = Nothing
   where
@@ -952,7 +951,7 @@ cond_RepresentableOk :: Condition
 cond_RepresentableOk (_,t) = canDoGenerics t
 
 cond_Representable1Ok :: Condition
-cond_Representable1Ok = cond_RepresentableOk `andCond` cond_functorOK True
+cond_Representable1Ok (_, t) = canDoGenerics1 t
 
 cond_enumOrProduct :: Class -> Condition
 cond_enumOrProduct cls = cond_isEnumeration `orCond`
@@ -1020,16 +1019,13 @@ functorLikeClassKeys :: [Unique]
 functorLikeClassKeys = [functorClassKey, foldableClassKey, traversableClassKey]
 
 cond_functorOK :: Bool -> Condition
-cond_functorOK b = cond_functorOK_tc b . snd
-
-cond_functorOK_tc :: Bool -> TyCon -> Maybe SDoc
 -- OK for Functor/Foldable/Traversable class
 -- Currently: (a) at least one argument
 --            (b) don't use argument contravariantly
 --            (c) don't use argument in the wrong place, e.g. data T a = T (X a a)
 --            (d) optionally: don't use function types
 --            (e) no "stupid context" on data type
-cond_functorOK_tc allowFunctions rep_tc
+cond_functorOK allowFunctions (_, rep_tc)
   | null tc_tvs
   = Just (ptext (sLit "Data type") <+> quotes (ppr rep_tc)
           <+> ptext (sLit "must have some type parameters"))

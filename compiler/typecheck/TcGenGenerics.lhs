@@ -6,6 +6,7 @@ The deriving code for the Generic class
 (equivalent to the code in TcGenDeriv, for other classes)
 
 \begin{code}
+{-# LANGUAGE ScopedTypeVariables #-}
 {-# OPTIONS -fno-warn-tabs #-}
 -- The above warning supression flag is a temporary kludge.
 -- While working on this module you are encouraged to remove it and
@@ -14,7 +15,8 @@ The deriving code for the Generic class
 -- for details
 
 
-module TcGenGenerics (canDoGenerics, GenericKind(..), DeriveGeneric(..),
+module TcGenGenerics (canDoGenerics, canDoGenerics1,
+                      GenericKind(..), DeriveGeneric(..),
                       gen_Generic_binds, get_gen1_constrained_tys) where
 
 
@@ -22,7 +24,6 @@ import DynFlags
 import HsSyn
 import Type
 import TcType
-import {-# SOURCE #-} TcDeriv (cond_functorOK_tc)
 import TcGenDeriv
 import DataCon
 import TyCon
@@ -42,10 +43,14 @@ import HscTypes
 import BuildTyCl
 import SrcLoc
 import Bag
-import VarSet (isEmptyVarSet)
+import VarSet (elemVarSet)
 import Outputable 
 import FastString
 import UniqSupply
+
+import Util (snocView)
+import Control.Monad (mplus)
+import qualified State as S
 
 #include "HsVersions.h"
 \end{code}
@@ -190,6 +195,17 @@ genDtMeta (tc,metaDts) =
 %************************************************************************
 
 \begin{code}
+get_gen1_constrained_tys :: TyVar -> [Type] -> [Type]
+-- called by TcDeriv.inferConstraints; generates a list of types, each of which
+-- must be a Functor in order for the Generic1 instance to work.
+get_gen1_constrained_tys argVar =
+  concatMap $ argTyFold argVar $ ArgTyAlg {
+    ata_rec0 = const [],
+    ata_par1 = [], ata_rec1 = const [],
+    ata_comp = (:)}
+
+
+
 canDoGenerics :: TyCon -> Maybe SDoc
 -- Called on source-code data types, to see if we should generate
 -- generic functions for them.
@@ -222,13 +238,98 @@ canDoGenerics tycon
 	-- Nor can we do the job if it's an existential data constructor,
 	-- Nor if the args are polymorphic types (I don't think)
     bad_arg_type ty = isUnLiftedType ty || not (isTauTy ty)
-    
-    mergeErrors :: [Maybe SDoc] -> Maybe SDoc
-    mergeErrors []           = Nothing
-    mergeErrors ((Just s):t) = case mergeErrors t of
-                                 Nothing -> Just s
-                                 Just s' -> Just (s <> text ", and" $$ s')
-    mergeErrors (Nothing :t) = mergeErrors t
+
+mergeErrors :: [Maybe SDoc] -> Maybe SDoc
+mergeErrors []           = Nothing
+mergeErrors ((Just s):t) = case mergeErrors t of
+  Nothing -> Just s
+  Just s' -> Just (s <> text ", and" $$ s')
+mergeErrors (Nothing :t) = mergeErrors t
+
+canDoGenerics1 :: TyCon -> Maybe SDoc
+-- Called on source-code data types, to see if we should generate
+-- generic functions for them.
+-- Nothing == yes
+-- Just s  == no, because of `s`
+
+-- (derived from TcDeriv.cond_functorOK; will be checked only if canDoGenerics
+-- passes)
+
+-- OK for Generic1/Rep1
+-- Currently: (a) at least one argument
+--            (b) don't use argument contravariantly
+--            (c) don't use argument in the wrong place, e.g. data T a = T (X a a)
+--            (d) no "stupid context" on data type
+canDoGenerics1 = flip S.evalState [] . canDoGenerics1_w
+
+-- the state is which tycons we have entered; it avoids divergence when we
+-- recur (robust against mutual recursion)
+canDoGenerics1_w :: TyCon -> S.State [Name] (Maybe SDoc)
+canDoGenerics1_w rep_tc
+  | null tc_tvs
+  = return $ Just (ptext (sLit "Data type") <+> quotes (ppr rep_tc)
+          <+> ptext (sLit "must have some type parameters"))
+
+  | not (null bad_stupid_theta)
+  = return $ Just (ptext (sLit "Data type") <+> quotes (ppr rep_tc)
+          <+> ptext (sLit "must not have a class context") <+> pprTheta bad_stupid_theta)
+
+  | otherwise
+  = (mergeErrors . concat) `fmap` mapM check_con data_cons
+  where
+    tc_tvs            = tyConTyVars rep_tc
+    Just (_, last_tv) = snocView tc_tvs
+    bad_stupid_theta  = filter is_bad (tyConStupidTheta rep_tc)
+    is_bad pred       = last_tv `elemVarSet` tyVarsOfType pred
+
+    data_cons = tyConDataCons rep_tc
+    check_con con = case check_vanilla con of
+      j@(Just _) -> return [j]
+      Nothing -> mapM snd $ foldDataConArgs (ft_check con) con
+
+    bad :: DataCon -> SDoc -> SDoc
+    bad con msg = ptext (sLit "Constructor") <+> quotes (ppr con) <+> msg
+
+    check_vanilla :: DataCon -> Maybe SDoc
+    check_vanilla con | isVanillaDataCon con = Nothing
+    		      | otherwise	     = Just (bad con existential)
+
+    -- the Bool is if the parameter occurs in the type
+    ft_check :: DataCon -> FFoldType (Bool, S.State [Name] (Maybe SDoc))
+    ft_check con = FT { ft_triv = bmzero, ft_var = (True, return Nothing)
+                      , ft_co_var = (True, return $ Just $ bad con covariant)
+	      	      , ft_fun = bmplus
+                      , ft_tup = \_ -> foldr bmplus bmzero
+                      , ft_ty_app = \ty x -> bmplus x $ (,) False $
+                          if fst x then representable ty else return Nothing
+                      , ft_bad_app = (True, return $ Just $ bad con wrong_arg)
+                      , ft_forall = \_ -> id }
+
+    bmzero = (False, return Nothing)
+    bmplus (b1, m1) (b2, m2) = (b1 || b2, m1 >>= maybe m2 (return . Just))
+
+    representable :: Type -> S.State [Name] (Maybe SDoc)
+    representable ty = case tcSplitTyConApp_maybe ty of
+      Nothing -> return Nothing
+      -- if it's a type constructor, it has to be representable
+      Just (tc, _) -> do
+        let n = tyConName tc
+        s <- S.get
+        -- internally assume that recursive occurrences are OK
+        if n `elem` s then return Nothing else do
+          S.put (n : s)
+          fmap {-maybe-} (\_ -> bad_app tc) -- don't give the message, just name what wasn't representable
+            `fmap` {-state-} case canDoGenerics tc of
+              j@(Just _) -> return j
+              -- only check Generic1 if it passes Generic
+              Nothing -> canDoGenerics1_w tc
+
+    existential = (ptext . sLit) "must not have existential arguments"
+    covariant   = (ptext . sLit) "must not use the type variable in a function argument"
+    wrong_arg   = (ptext . sLit) "must use the type variable only as the last argument of a data type"
+    bad_app tc  = (ptext . sLit) "must not apply unrepresentable type constructors (such as" <+> ppr (tyConName tc)
+                  <> (ptext . sLit) ") to arguments that involve type parameters"
+
 \end{code}
 
 %************************************************************************
@@ -325,56 +426,64 @@ tc_mkRepFamInsts gk tycon metaDts mod =
 --------------------------------------------------------------------------------
 
 data ArgTyAlg a = ArgTyAlg
-  { ata_par0 :: (Type -> a), ata_rec0 :: (Type -> a)
+  { ata_rec0 :: (Type -> a)
   , ata_par1 :: a, ata_rec1 :: (Type -> a)
   , ata_comp :: (Type -> a -> a)
   }
 
--- | Interpret a type (as an argument to a data constructor) based on that
--- type's Generic structure. (Figure 3 from <http://dreixel.net/research/pdf/gdmh.pdf>)
-argTyFold :: TyVar -> ArgTyAlg a -> Type -> a
-argTyFold argVar (ArgTyAlg {ata_par0 = mkPar0, ata_rec0 = mkRec0,
+-- | @argTyFold@ implements a generalised and safer variant of the @arg@
+-- function from Figure 3 in <http://dreixel.net/research/pdf/gdmh.pdf>. @arg@
+-- is conceptually equivalent to:
+--
+-- > arg t = case t of
+-- >   _ | isTyVar t         -> if (t == argVar) then Par1 else Par0 t
+-- >   App f [t'] |
+--       representable1 f &&
+--       t' == argVar        -> Rec1 f
+-- >   App f [t'] |
+--       representable1 f &&
+--       t' has tyvars       -> f :.: (arg t')
+-- >   _                     -> Rec0 t
+--
+-- where @argVar@ is the last type variable in the data type declaration we are
+-- finding the representation for.
+--
+-- @argTyFold@ is more general than @arg@ because it uses 'ArgTyAlg' to
+-- abstract out the concrete invocations of @Par0@, @Rec0@, @Par1@, @Rec1@, and
+-- @:.:@.
+--
+-- @argTyFold@ is safer than @arg@ because @arg@ leads to GHC panics for some
+-- data types. The problematic case is when @t@ is an application of a
+-- non-representable type @f@ to @argVar@: @App f [argVar]@ is caught by the
+-- @_@ pattern, and ends up represented as @Rec0 t@. This type occurs /free/ in
+-- the RHS of the eventual @Rep1@ instance, which is therefore ill-formed. Some
+-- representable1 checks have been relaxed, and others were moved to
+-- @canDoGenerics1@.
+argTyFold :: forall a. TyVar -> ArgTyAlg a -> Type -> a
+argTyFold argVar (ArgTyAlg {ata_rec0 = mkRec0,
                             ata_par1 = mkPar1, ata_rec1 = mkRec1,
-                            ata_comp = mkComp}) = go1 where
-  -- First check if the argument is a parameter.
-  go1 t = case getTyVar_maybe t of
-    Just t' -> if (t' == argVar)
-               -- The argument is "the" parameter
-               then mkPar1  -- gdmh.pdf, Figure 3, arg case 2
-               -- The argument is some other type variable
-               else mkPar0 t  -- gdmh.pdf, Figure 3, arg case 1
-    -- The argument is not a type variable
-    Nothing -> go2 t
+                            ata_comp = mkComp}) = \t -> maybe (mkRec0 t) id $ go t where
+  go :: Type -> -- type to represent
+        Maybe a -- the result (e.g. representation type), unless it's trivial
+  go t = isParam `mplus` isApp where
 
-  -- Check if the argument is an application.
-  go2 t = case splitTyConApp_maybe t of
-    Just (t1,t2)
-      -- Is it a tycon applied to "the" parameter?
-      | getTyVar_maybe lastArg == Just argVar -> 
-        -- Yes, use Rec1
-        mkRec1 t1App  -- gdmh.pdf, Figure 3, arg case 3
+    isParam = do -- handles parameters
+      t' <- getTyVar_maybe t
+      Just $ if t' == argVar then mkPar1 -- moreover, it is "the" parameter
+             else mkRec0 t
 
-        -- Is t1 functorial?
-      | isNothing (cond_functorOK_tc True t1)
-                 -- And does lastArg contain variables?
-                 && not (isEmptyVarSet (exactTyVarsOfType lastArg)) ->
-        -- It's a composition
-        mkComp t1App (go2 lastArg)  -- gdmh.pdf, Figure 3, arg case 4
+    isApp = do -- handles applications
+      (phi, beta) <- tcSplitAppTy_maybe t
 
-      where lastArg = ASSERT (length t2 > 0)
-                      last t2
-            t1App   = mkTyConApp t1 (init t2)
-            isNothing = maybe True (const False)
+      let interesting = argVar `elemVarSet` exactTyVarsOfType beta
 
-        -- Ok, I don't recognize it as anything special, so I use Rec0.
-    _ -> mkRec0 t  -- gdmh.pdf, Figure 3, arg case 5
+      -- Does it have no interesting structure to represent?
+      if not interesting then Nothing
+        else -- Is the argument the parameter?
+          if Just argVar == getTyVar_maybe beta then Just $ mkRec1 phi
+            else mkComp phi `fmap` go beta -- It must be a composition.
 
 
-get_gen1_constrained_tys :: TyVar -> [Type] -> [Type]
-get_gen1_constrained_tys argVar = concatMap $
-  argTyFold argVar $ ArgTyAlg {ata_par0 = const [], ata_rec0 = const [],
-                               ata_par1 = [], ata_rec1 = const [],
-                               ata_comp = (:)}
 
 
 
@@ -448,7 +557,7 @@ tc_mkRepTy gk tycon metaDts =
               let argVar = ASSERT (length (tyConTyVars tycon) >= 1)
                            last (tyConTyVars tycon)
               in argTyFold argVar $ ArgTyAlg
-                   {ata_par0 = mkPar0, ata_rec0 = mkRec0, ata_par1 = mkPar1,
+                   {ata_rec0 = mkRec0, ata_par1 = mkPar1,
                     ata_rec1 = mkRec1, ata_comp = mkComp}
         
        
@@ -584,7 +693,7 @@ mk1Sum gk_ us i n datacon = (from_alt, to_alt)
         where
           argTo (var, ty) = (\f -> f ty `nlHsApp` nlHsVar var) $ argTyFold argVar $
             ArgTyAlg
-            {ata_par0 = const $ nlHsVar unK1_RDR, ata_rec0 = const $ nlHsVar unK1_RDR,
+            {ata_rec0 = const $ nlHsVar unK1_RDR,
              ata_par1 = nlHsVar unPar1_RDR, ata_rec1 = const $ nlHsVar unRec1_RDR,
              ata_comp = \_ cnv -> (nlHsVar fmap_RDR `nlHsApp` cnv) `nlHsCompose`
                                   nlHsVar unComp1_RDR }
@@ -631,7 +740,7 @@ wrapArg_E Gen0_          (var, _)  = mkM1_E (k1DataCon_RDR `nlHsVarApps` [var])
 wrapArg_E (Gen1_ argVar) (var, ty) = mkM1_E $
                          -- This M1 is meta-information for the selector
   (\f -> f ty `nlHsApp` nlHsVar var) $ argTyFold argVar $ ArgTyAlg
-  {ata_par0 = const $ nlHsVar k1DataCon_RDR, ata_rec0 = const $ nlHsVar k1DataCon_RDR,
+  {ata_rec0 = const $ nlHsVar k1DataCon_RDR,
    ata_par1 = nlHsVar par1DataCon_RDR, ata_rec1 = const $ nlHsVar rec1DataCon_RDR,
    ata_comp = \_ cnv -> nlHsVar comp1DataCon_RDR `nlHsCompose`
                         (nlHsVar fmap_RDR `nlHsApp` cnv) }
