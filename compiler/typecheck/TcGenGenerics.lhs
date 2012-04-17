@@ -425,6 +425,9 @@ tc_mkRepFamInsts gk tycon metaDts mod =
 -- Type representation
 --------------------------------------------------------------------------------
 
+-- | See documentation of 'argTyFold'; that function uses the fields of this
+-- type to interpret the structure of a type when that type is considered as an
+-- argument to a constructor that is being represented with 'Rep1'.
 data ArgTyAlg a = ArgTyAlg
   { ata_rec0 :: (Type -> a)
   , ata_par1 :: a, ata_rec1 :: (Type -> a)
@@ -452,8 +455,8 @@ data ArgTyAlg a = ArgTyAlg
 -- abstract out the concrete invocations of @Par0@, @Rec0@, @Par1@, @Rec1@, and
 -- @:.:@.
 --
--- @argTyFold@ is safer than @arg@ because @arg@ leads to GHC panics for some
--- data types. The problematic case is when @t@ is an application of a
+-- @argTyFold@ is safer than @arg@ because @arg@ would lead to a GHC panic for
+-- some data types. The problematic case is when @t@ is an application of a
 -- non-representable type @f@ to @argVar@: @App f [argVar]@ is caught by the
 -- @_@ pattern, and ends up represented as @Rec0 t@. This type occurs /free/ in
 -- the RHS of the eventual @Rep1@ instance, which is therefore ill-formed. Some
@@ -462,15 +465,18 @@ data ArgTyAlg a = ArgTyAlg
 argTyFold :: forall a. TyVar -> ArgTyAlg a -> Type -> a
 argTyFold argVar (ArgTyAlg {ata_rec0 = mkRec0,
                             ata_par1 = mkPar1, ata_rec1 = mkRec1,
-                            ata_comp = mkComp}) = \t -> maybe (mkRec0 t) id $ go t where
-  go :: Type -> -- type to represent
+                            ata_comp = mkComp}) =
+  -- mkRec0 is the default; use it if there is no interesting structure
+  -- (e.g. occurrences of parameters or recursive occurrences)
+  \t -> maybe (mkRec0 t) id $ go t where
+  go :: Type -> -- type to fold through
         Maybe a -- the result (e.g. representation type), unless it's trivial
   go t = isParam `mplus` isApp where
 
     isParam = do -- handles parameters
       t' <- getTyVar_maybe t
       Just $ if t' == argVar then mkPar1 -- moreover, it is "the" parameter
-             else mkRec0 t
+             else mkRec0 t -- NB mkRec0 instead of the conventional mkPar0
 
     isApp = do -- handles applications
       (phi, beta) <- tcSplitAppTy_maybe t
@@ -479,7 +485,7 @@ argTyFold argVar (ArgTyAlg {ata_rec0 = mkRec0,
 
       -- Does it have no interesting structure to represent?
       if not interesting then Nothing
-        else -- Is the argument the parameter?
+        else -- Is the argument the parameter? Special case for mkRec1.
           if Just argVar == getTyVar_maybe beta then Just $ mkRec1 phi
             else mkComp phi `fmap` go beta -- It must be a composition.
 
