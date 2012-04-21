@@ -386,7 +386,7 @@ mkBindsRep gk tycon =
                     where tyvars = tyConTyVars tycon
         
 --------------------------------------------------------------------------------
--- The type instance synonym and synonym
+-- The type synonym instance and synonym
 --       type instance Rep (D a b) = Rep_D a b
 --       type Rep_D a b = ...representation type for D ...
 --------------------------------------------------------------------------------
