@@ -664,7 +664,7 @@ notAssocDataCon_RDR   = dataQual_RDR gHC_GENERICS (fsLit "NotAssociative")
 
 
 fmap_RDR, pure_RDR, ap_RDR, foldable_foldr_RDR, traverse_RDR :: RdrName
-fmap_RDR                = varQual_RDR gHC_BASE (fsLit "fmap")
+fmap_RDR                = varQual_RDR gHC_CLASSES         (fsLit "fmap")
 pure_RDR                = varQual_RDR cONTROL_APPLICATIVE (fsLit "pure")
 ap_RDR                  = varQual_RDR cONTROL_APPLICATIVE (fsLit "<*>")
 foldable_foldr_RDR      = varQual_RDR dATA_FOLDABLE       (fsLit "foldr")
@@ -769,8 +769,8 @@ eqClassName       = clsQual  gHC_CLASSES (fsLit "Eq")      eqClassKey
 eqName            = methName gHC_CLASSES (fsLit "==")      eqClassOpKey
 ordClassName      = clsQual  gHC_CLASSES (fsLit "Ord")     ordClassKey
 geName            = methName gHC_CLASSES (fsLit ">=")      geClassOpKey
-functorClassName  = clsQual  gHC_BASE (fsLit "Functor") functorClassKey
-fmapName          = methName gHC_BASE (fsLit "fmap")    fmapClassOpKey
+functorClassName  = clsQual  gHC_CLASSES (fsLit "Functor") functorClassKey
+fmapName          = methName gHC_CLASSES (fsLit "fmap")    fmapClassOpKey
 
 -- Class Monad
 monadClassName, thenMName, bindMName, returnMName, failMName :: Name
