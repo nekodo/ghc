@@ -62,6 +62,7 @@ module HscMain
     , hscTcRnGetInfo
     , hscCheckSafe
 #ifdef GHCI
+    , hscIsGHCiMonad
     , hscGetModuleInterface
     , hscRnImportDecls
     , hscTcRnLookupRdrName
@@ -311,6 +312,11 @@ hscTcRnGetInfo hsc_env0 name = runInteractiveHsc hsc_env0 $ do
   ioMsgMaybe' $ tcRnGetInfo hsc_env name
 
 #ifdef GHCI
+hscIsGHCiMonad :: HscEnv -> String -> IO Name
+hscIsGHCiMonad hsc_env name =
+    let icntxt   = hsc_IC hsc_env
+    in runHsc hsc_env $ ioMsgMaybe $ isGHCiMonad hsc_env icntxt name
+
 hscGetModuleInterface :: HscEnv -> Module -> IO ModIface
 hscGetModuleInterface hsc_env0 mod = runInteractiveHsc hsc_env0 $ do
   hsc_env <- getHscEnv
@@ -1397,7 +1403,7 @@ IO monad as explained in Note [Interactively-bound Ids in GHCi] in TcRnDriver
 --
 -- We return Nothing to indicate an empty statement (or comment only), not a
 -- parse error.
-hscStmt :: HscEnv -> String -> IO (Maybe ([Id], IO [HValue]))
+hscStmt :: HscEnv -> String -> IO (Maybe ([Id], IO [HValue], FixityEnv))
 hscStmt hsc_env stmt = hscStmtWithLocation hsc_env stmt "<interactive>" 1
 
 -- | Compile a stmt all the way to an HValue, but don't run it
@@ -1408,7 +1414,7 @@ hscStmtWithLocation :: HscEnv
                     -> String -- ^ The statement
                     -> String -- ^ The source
                     -> Int    -- ^ Starting line
-                    -> IO (Maybe ([Id], IO [HValue]))
+                    -> IO (Maybe ([Id], IO [HValue], FixityEnv))
 hscStmtWithLocation hsc_env0 stmt source linenumber =
  runInteractiveHsc hsc_env0 $ do
     hsc_env <- getHscEnv
@@ -1425,7 +1431,7 @@ hscStmtWithLocation hsc_env0 stmt source linenumber =
             -- Rename and typecheck it
             -- Here we lift the stmt into the IO monad, see Note
             -- [Interactively-bound Ids in GHCi] in TcRnDriver
-            (ids, tc_expr) <- ioMsgMaybe $ tcRnStmt hsc_env icntxt parsed_stmt
+            (ids, tc_expr, fix_env) <- ioMsgMaybe $ tcRnStmt hsc_env icntxt parsed_stmt
 
             -- Desugar it
             ds_expr <- ioMsgMaybe $
@@ -1437,7 +1443,7 @@ hscStmtWithLocation hsc_env0 stmt source linenumber =
             hval    <- liftIO $ hscCompileCoreExpr hsc_env src_span ds_expr
             let hval_io = unsafeCoerce# hval :: IO [HValue]
 
-            return $ Just (ids, hval_io)
+            return $ Just (ids, hval_io, fix_env)
 
 -- | Compile a decls
 hscDecls :: HscEnv
@@ -1471,8 +1477,8 @@ hscDeclsWithLocation hsc_env0 str source linenumber =
     {- Desugar it -}
     -- We use a basically null location for iNTERACTIVE
     let iNTERACTIVELoc = ModLocation{ ml_hs_file   = Nothing,
-                                      ml_hi_file   = undefined,
-                                      ml_obj_file  = undefined}
+                                      ml_hi_file   = panic "hsDeclsWithLocation:ml_hi_file",
+                                      ml_obj_file  = panic "hsDeclsWithLocation:ml_hi_file"}
     ds_result <- hscDesugar' iNTERACTIVELoc tc_gblenv
 
     {- Simplify -}

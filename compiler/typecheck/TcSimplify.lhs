@@ -22,13 +22,13 @@ import TcSMonad
 import TcInteract 
 import Inst
 import Unify	( niFixTvSubst, niSubstTvSet )
+import Type     ( classifyPredType, PredTree(..) )
 import Var
 import VarSet
 import VarEnv 
 import TcEvidence
 import TypeRep
 import Name
-import NameEnv	( emptyNameEnv )
 import Bag
 import ListSetOps
 import Util
@@ -527,150 +527,60 @@ over implicit parameters. See the predicate isFreeWhenInferring.
 *                                                                                 *
 ***********************************************************************************
 
-Note [Simplifying RULE lhs constraints]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-On the LHS of transformation rules we only simplify only equalities,
-but not dictionaries.  We want to keep dictionaries unsimplified, to
-serve as the available stuff for the RHS of the rule.  We *do* want to
-simplify equalities, however, to detect ill-typed rules that cannot be
-applied.
+See note [Simplifying RULE consraints] in TcRule
 
-Implementation: the TcSFlags carried by the TcSMonad controls the
-amount of simplification, so simplifyRuleLhs just sets the flag
-appropriately.
+Note [RULE quanfification over equalities]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Decideing which equalities to quantify over is tricky:
+ * We do not want to quantify over insoluble equalities (Int ~ Bool)
+    (a) because we prefer to report a LHS type error
+    (b) because if such things end up in 'givens' we get a bogus
+        "inaccessible code" error
 
-Example.  Consider the following left-hand side of a rule
-	f (x == y) (y > z) = ...
-If we typecheck this expression we get constraints
-	d1 :: Ord a, d2 :: Eq a
-We do NOT want to "simplify" to the LHS
-	forall x::a, y::a, z::a, d1::Ord a.
-	  f ((==) (eqFromOrd d1) x y) ((>) d1 y z) = ...
-Instead we want	
-	forall x::a, y::a, z::a, d1::Ord a, d2::Eq a.
-	  f ((==) d2 x y) ((>) d1 y z) = ...
+ * But we do want to quantify over things like (a ~ F b), where
+   F is a type function.
 
-Here is another example:
-	fromIntegral :: (Integral a, Num b) => a -> b
-	{-# RULES "foo"  fromIntegral = id :: Int -> Int #-}
-In the rule, a=b=Int, and Num Int is a superclass of Integral Int. But
-we *dont* want to get
-	forall dIntegralInt.
-	   fromIntegral Int Int dIntegralInt (scsel dIntegralInt) = id Int
-because the scsel will mess up RULE matching.  Instead we want
-	forall dIntegralInt, dNumInt.
-	  fromIntegral Int Int dIntegralInt dNumInt = id Int
-
-Even if we have 
-	g (x == y) (y == z) = ..
-where the two dictionaries are *identical*, we do NOT WANT
-	forall x::a, y::a, z::a, d1::Eq a
-	  f ((==) d1 x y) ((>) d1 y z) = ...
-because that will only match if the dict args are (visibly) equal.
-Instead we want to quantify over the dictionaries separately.
-
-In short, simplifyRuleLhs must *only* squash equalities, leaving
-all dicts unchanged, with absolutely no sharing.  
-
-HOWEVER, under a nested implication things are different
-Consider
-  f :: (forall a. Eq a => a->a) -> Bool -> ...
-  {-# RULES "foo" forall (v::forall b. Eq b => b->b).
-       f b True = ...
-    #-}
-Here we *must* solve the wanted (Eq a) from the given (Eq a)
-resulting from skolemising the agument type of g.  So we 
-revert to SimplCheck when going under an implication.  
+The difficulty is that it's hard to tell what is insoluble!
+So we see whether the simplificaiotn step yielded any type errors,
+and if so refrain from quantifying over *any* equalites.
 
 \begin{code}
 simplifyRule :: RuleName 
-             -> [TcTyVar]		-- Explicit skolems
              -> WantedConstraints	-- Constraints from LHS
              -> WantedConstraints	-- Constraints from RHS
-             -> TcM ([EvVar], 		-- LHS dicts
-                     TcEvBinds,		-- Evidence for LHS
-                     TcEvBinds)		-- Evidence for RHS
--- See Note [Simplifying RULE lhs constraints]
-simplifyRule name tv_bndrs lhs_wanted rhs_wanted
-  = do { loc        <- getCtLoc (RuleSkol name)
+             -> TcM ([EvVar], WantedConstraints)   -- LHS evidence varaibles
+-- See Note [Simplifying RULE constraints] in TcRule
+simplifyRule name lhs_wanted rhs_wanted
+  = do { zonked_all <- zonkWC (lhs_wanted `andWC` rhs_wanted)
+       ; let doc = ptext (sLit "LHS of rule") <+> doubleQuotes (ftext name)
+	     untch = NoUntouchables
+             	 -- We allow ourselves to unify environment 
+		 -- variables; hence NoUntouchables
+
+       ; (resid_wanted, _) <- runTcS (SimplInfer doc) untch emptyInert emptyWorkList $
+                              solveWanteds zonked_all
+
        ; zonked_lhs <- zonkWC lhs_wanted
-       ; let untch = NoUntouchables
-	     	 -- We allow ourselves to unify environment 
-		 -- variables; hence *no untouchables*
 
--- DV: SPJ and I discussed a new plan here:
--- Step 1: Simplify everything in the same bag
--- Step 2: zonk away the lhs constraints and get only the non-trivial ones
--- Step 3: do the implications with these constraints
--- This will have the advantage that (i) we no longer need simplEqsOnly flag
--- and (ii) will fix problems appearing from touchable unification variables
--- in the givens, manifested by #5853
--- TODO ... 
+       ; let (q_cts, non_q_cts) = partitionBag quantify_me (wc_flat zonked_lhs)
+             quantify_me  -- Note [RULE quantification over equalities]
+               | insolubleWC resid_wanted = quantify_insol
+               | otherwise                = quantify_normal
 
-       ; (lhs_results, lhs_binds)
-              <- runTcS (SimplRuleLhs name) untch emptyInert emptyWorkList $
-                 solveWanteds zonked_lhs
+             quantify_insol ct = not (isEqPred (ctPred ct))
 
+             quantify_normal ct
+               | EqPred t1 t2 <- classifyPredType (ctPred ct)
+               = not (t1 `eqType` t2)
+               | otherwise
+               = True
+             
        ; traceTc "simplifyRule" $
-         vcat [ text "zonked_lhs"   <+> ppr zonked_lhs 
-              , text "lhs_results"  <+> ppr lhs_results
-              , text "lhs_binds"    <+> ppr lhs_binds 
-              , text "rhs_wanted"   <+> ppr rhs_wanted ]
+         vcat [ text "zonked_lhs" <+> ppr zonked_lhs 
+              , text "q_cts"      <+> ppr q_cts ]
 
-
-       -- Don't quantify over equalities (judgement call here)
-       ; let (eqs, dicts) = partitionBag (isEqPred . ctPred)
-                                         (wc_flat lhs_results)
-             lhs_dicts    = map ctId (bagToList dicts)
-                                 -- Dicts and implicit parameters
-                                 -- NB: dicts come from lhs_results which
-                                 -- are all Wanted, hence have ids, hence
-                                 -- it's fine to call ctId on them
-
-           -- Fail if we have not got down to unsolved flats
-       ; ev_binds_var <- newTcEvBinds
-       ; emitImplication $ Implic { ic_untch  = untch
-                                  , ic_env    = emptyNameEnv
-                                  , ic_skols  = tv_bndrs
-                                  , ic_given  = lhs_dicts
-                                  , ic_wanted = lhs_results { wc_flat = eqs }
-                                  , ic_insol  = insolubleWC lhs_results
-                                  , ic_binds  = ev_binds_var
-                                  , ic_loc    = loc }
-
-	     -- Notice that we simplify the RHS with only the explicitly
-	     -- introduced skolems, allowing the RHS to constrain any 
-	     -- unification variables.
-	     -- Then, and only then, we call zonkQuantifiedTypeVariables
-	     -- Example   foo :: Ord a => a -> a
-	     --		  foo_spec :: Int -> Int
-	     --		  {-# RULE "foo"  foo = foo_spec #-}
-	     --	    Here, it's the RHS that fixes the type variable
-
-	     -- So we don't want to make untouchable the type
-	     -- variables in the envt of the RHS, because they include
-	     -- the template variables of the RULE
-
-	     -- Hence the rather painful ad-hoc treatement here
-       ; rhs_binds_var@(EvBindsVar evb_ref _)  <- newTcEvBinds
-       ; let doc = ptext (sLit "rhs of rule") <+> doubleQuotes (ftext name)
-       ; rhs_binds1 <- simplifyCheck (SimplCheck doc) $
-            WC { wc_flat = emptyBag
-               , wc_insol = emptyBag
-               , wc_impl = unitBag $
-                    Implic { ic_untch   = NoUntouchables
-                            , ic_env    = emptyNameEnv
-                            , ic_skols  = tv_bndrs
-                            , ic_given  = lhs_dicts
-                            , ic_wanted = rhs_wanted
-                            , ic_insol  = insolubleWC rhs_wanted
-                            , ic_binds  = rhs_binds_var
-                            , ic_loc    = loc } }
-       ; rhs_binds2 <- readTcRef evb_ref
-
-       ; return ( lhs_dicts
-                , EvBinds lhs_binds 
-                , EvBinds (rhs_binds1 `unionBags` evBindMapBinds rhs_binds2)) }
+       ; return ( map (ctEvId . ctEvidence) (bagToList q_cts)
+                , zonked_lhs { wc_flat = non_q_cts }) }
 \end{code}
 
 
@@ -875,10 +785,11 @@ solveNestedImplications implics
   where givens_from_wanteds = foldrBag get_wanted []
         get_wanted cc rest_givens
             | pushable_wanted cc
-            = let fl = cc_flavor cc
-                  wloc = flav_wloc fl
-                  gfl = Given (mkGivenLoc wloc UnkSkol) (flav_evar fl) 
-                  this_given = cc { cc_flavor = gfl }
+            = let fl   = ctEvidence cc
+                  gfl  = Given { ctev_gloc = setCtLocOrigin (ctev_wloc fl) UnkSkol
+                               , ctev_evtm = EvId (ctev_evar fl)
+                               , ctev_pred = ctev_pred fl }
+                  this_given = cc { cc_ev = gfl }
               in this_given : rest_givens
             | otherwise = rest_givens 
 
@@ -1116,20 +1027,20 @@ solveCTyFunEqs cts
 
       ; return (niFixTvSubst ni_subst, unsolved_can_cts) }
   where
-    solve_one (Wanted _ cv,tv,ty) 
+    solve_one (Wanted { ctev_evar = cv }, tv, ty) 
       = setWantedTyBind tv ty >> setEvBind cv (EvCoercion (mkTcReflCo ty))
     solve_one (Derived {}, tv, ty)
       = setWantedTyBind tv ty
     solve_one arg
       = pprPanic "solveCTyFunEqs: can't solve a /given/ family equation!" $ ppr arg
 ------------
-type FunEqBinds = (TvSubstEnv, [(CtFlavor, TcTyVar, TcType)])
+type FunEqBinds = (TvSubstEnv, [(CtEvidence, TcTyVar, TcType)])
   -- The TvSubstEnv is not idempotent, but is loop-free
   -- See Note [Non-idempotent substitution] in Unify
 emptyFunEqBinds :: FunEqBinds
 emptyFunEqBinds = (emptyVarEnv, [])
 
-extendFunEqBinds :: FunEqBinds -> CtFlavor -> TcTyVar -> TcType -> FunEqBinds
+extendFunEqBinds :: FunEqBinds -> CtEvidence -> TcTyVar -> TcType -> FunEqBinds
 extendFunEqBinds (tv_subst, cv_binds) fl tv ty
   = (extendVarEnv tv_subst tv ty, (fl, tv, ty):cv_binds)
 
@@ -1143,7 +1054,7 @@ getSolvableCTyFunEqs untch cts
     dflt_funeq :: (Cts, FunEqBinds) -> Ct
                -> (Cts, FunEqBinds)
     dflt_funeq (cts_in, feb@(tv_subst, _))
-               (CFunEqCan { cc_flavor = fl
+               (CFunEqCan { cc_ev = fl
                           , cc_fun = tc
                           , cc_tyargs = xis
                           , cc_rhs = xi })
@@ -1162,7 +1073,7 @@ getSolvableCTyFunEqs untch cts
 
       , not (tv `elemVarSet` niSubstTvSet tv_subst (tyVarsOfTypes xis))
            -- Occurs check: see Note [Solving Family Equations], Point 2
-      = ASSERT ( not (isGivenOrSolved fl) )
+      = ASSERT ( not (isGiven fl) )
         (cts_in, extendFunEqBinds feb fl tv (mkTyConApp tc xis))
 
     dflt_funeq (cts_in, fun_eq_binds) ct
@@ -1301,16 +1212,16 @@ defaultTyVar untch the_tv
   , not (k `eqKind` default_k)
   = tryTcS $ -- Why tryTcS? See Note [tryTcS in defaulting]
     do { let loc = CtLoc DefaultOrigin (getSrcSpan the_tv) [] -- Yuk
-       ; eqv <- TcSMonad.newKindConstraint the_tv default_k
+       ; eqv <- TcSMonad.newKindConstraint loc the_tv default_k
        ; case eqv of
            Fresh x -> 
              return $ unitBag $
-             CNonCanonical { cc_flavor = Wanted loc x, cc_depth = 0 }
+             CNonCanonical { cc_ev = x, cc_depth = 0 }
            Cached _ -> return emptyBag }
 {- DELETEME
          if isNewEvVar eqv then 
              return $ unitBag (CNonCanonical { cc_id = evc_the_evvar eqv
-                                             , cc_flavor = fl, cc_depth = 0 })
+                                             , cc_ev = fl, cc_depth = 0 })
          else return emptyBag }
 -}
 
@@ -1391,13 +1302,12 @@ disambigGroup (default_ty:default_tys) group
        ; success <- tryTcS $ -- Why tryTcS? See Note [tryTcS in defaulting]
                     do { derived_eq <- tryTcS $
                                        -- I need a new tryTcS because we will call solveInteractCts below!
-                            do { md <- newDerived (mkTcEqPred (mkTyVarTy the_tv) default_ty)
+                            do { md <- newDerived (ctev_wloc the_fl) 
+                                                  (mkTcEqPred (mkTyVarTy the_tv) default_ty)
+                                                  -- ctev_wloc because constraint is not Given!
                                ; case md of 
-                                    Cached _ -> return []
-                                    Fresh pty -> 
-                                      -- flav_wloc because constraint is not Given/Solved!
-                                      let dfl = Derived (flav_wloc the_fl) pty
-                                      in return [ CNonCanonical { cc_flavor = dfl, cc_depth = 0 } ] }
+                                    Nothing   -> return []
+                                    Just ctev -> return [ mkNonCanonical ctev ] }
                             
                        ; traceTcS "disambigGroup (solving) {" 
                                   (text "trying to solve constraints along with default equations ...")
@@ -1426,7 +1336,7 @@ disambigGroup (default_ty:default_tys) group
                        ; disambigGroup default_tys group } }
   where
     ((the_ct,the_tv):_) = group
-    the_fl              = cc_flavor the_ct
+    the_fl              = cc_ev the_ct
     wanteds             = map fst group
 \end{code}
 
@@ -1456,9 +1366,12 @@ newFlatWanteds :: CtOrigin -> ThetaType -> TcM [Ct]
 newFlatWanteds orig theta
   = do { loc <- getCtLoc orig
        ; mapM (inst_to_wanted loc) theta }
-  where inst_to_wanted loc pty 
+  where 
+    inst_to_wanted loc pty 
           = do { v <- TcMType.newWantedEvVar pty 
                ; return $ 
-                 CNonCanonical { cc_flavor = Wanted loc v
+                 CNonCanonical { cc_ev = Wanted { ctev_evar = v
+                                                , ctev_wloc = loc
+                                                , ctev_pred = pty }
                                , cc_depth = 0 } }
 \end{code}

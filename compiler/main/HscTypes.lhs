@@ -136,7 +136,7 @@ import Annotations
 import Class
 import TyCon
 import DataCon
-import PrelNames        ( gHC_PRIM )
+import PrelNames        ( gHC_PRIM, ioTyConName )
 import Packages hiding  ( Version(..) )
 import DynFlags
 import DriverPhases
@@ -910,6 +910,9 @@ data InteractiveContext
              -- ^ The 'DynFlags' used to evaluate interative expressions
              -- and statements.
 
+         ic_monad      :: Name,
+             -- ^ The monad that GHCi is executing in
+
          ic_imports    :: [InteractiveImport],
              -- ^ The GHCi context is extended with these imports
              --
@@ -938,6 +941,9 @@ data InteractiveContext
              -- That is, rather than re-check the overlapping each
              -- time we update the context, we just take the results
              -- from the instance code that already does that.
+
+         ic_fix_env :: FixityEnv,
+            -- ^ Fixities declared in let statements
 
 #ifdef GHCI
           ic_resume :: [Resume],
@@ -973,11 +979,14 @@ hscDeclsWithLocation) and save them in ic_sys_vars.
 emptyInteractiveContext :: DynFlags -> InteractiveContext
 emptyInteractiveContext dflags
   = InteractiveContext { ic_dflags     = dflags,
+                         -- IO monad by default
+                         ic_monad      = ioTyConName,
                          ic_imports    = [],
                          ic_rn_gbl_env = emptyGlobalRdrEnv,
                          ic_tythings   = [],
                          ic_sys_vars   = [],
                          ic_instances  = ([],[]),
+                         ic_fix_env    = emptyNameEnv,
 #ifdef GHCI
                          ic_resume     = [],
 #endif

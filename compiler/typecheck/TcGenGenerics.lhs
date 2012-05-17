@@ -403,23 +403,23 @@ tc_mkRepFamInsts gk tycon metaDts mod =
          Gen0 -> tcLookupTyCon repTyConName
          Gen1 -> tcLookupTyCon rep1TyConName
 
+     ; let -- `tyvars` = [a,b]
+           tyvars     = (case gk of Gen0 -> id; Gen1 -> init) tyConTyVars tycon
+           tyvar_args = mkTyVarTys tyvars
+
+           -- `appT` = D a b
+           appT = [mkTyConApp tycon tyvar_args]
+
        -- `repTy` = D1 ... (C1 ... (S1 ... (Rec0 a))) :: * -> *
-     ; repTy <- tc_mkRepTy gk tycon metaDts
+     ; repTy <- tc_mkRepTy gk tycon tyvar_args metaDts
     
        -- `rep_name` is a name we generate for the synonym
      ; rep_name <- let mkGen = case gk of Gen0 -> mkGenR; Gen1 -> mkGen1R
                    in newGlobalBinder mod (mkGen (nameOccName (tyConName tycon)))
                         (nameSrcSpan (tyConName tycon))
 
-     ; let -- `tyvars` = [a,b]
-           tyvars  = (case gk of Gen0 -> id; Gen1 -> init) (tyConTyVars tycon)
-
-           -- `appT` = D a b
-           appT = [mkTyConApp tycon (mkTyVarTys tyvars)]
      ; return $ mkSynFamInst rep_name tyvars rep appT repTy
      }
-
-
 
 --------------------------------------------------------------------------------
 -- Type representation
@@ -490,18 +490,17 @@ argTyFold argVar (ArgTyAlg {ata_rec0 = mkRec0,
             else mkComp phi `fmap` go beta -- It must be a composition.
 
 
-
-
-
 tc_mkRepTy ::  -- Gen0 or Gen1, for Rep or Rep1
                GenericKind
               -- The type to generate representation for
-            -> TyCon 
+            -> TyCon
+              -- ?
+            -> [Type] 
                -- Metadata datatypes to refer to
             -> MetaTyCons 
                -- Generated representation0 type
             -> TcM Type
-tc_mkRepTy gk tycon metaDts = 
+tc_mkRepTy gk tycon ty_args metaDts = 
   do
     d1    <- tcLookupTyCon d1TyConName
     c1    <- tcLookupTyCon c1TyConName
@@ -525,7 +524,7 @@ tc_mkRepTy gk tycon metaDts =
         mkPar0 a   = mkTyConApp par0  [a]
         mkPar1     = mkTyConTy  par1
         mkD    a   = mkTyConApp d1    [metaDTyCon, sumP (tyConDataCons a)]
-        mkC  i d a = mkTyConApp c1    [d, prod i (dataConOrigArgTys a) 
+        mkC  i d a = mkTyConApp c1    [d, prod i (dataConInstOrigArgTys a ty_args) 
                                                  (null (dataConFieldLabels a))]
         -- This field has no label
         mkS True  _ a = mkTyConApp s1 [mkTyConTy nS1, a]

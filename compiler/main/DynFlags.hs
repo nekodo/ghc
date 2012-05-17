@@ -38,6 +38,7 @@ module DynFlags (
         GhcMode(..), isOneShot,
         GhcLink(..), isNoLink,
         PackageFlag(..),
+        PkgConfRef(..),
         Option(..), showOpt,
         DynLibLoader(..),
         fFlags, fWarningFlags, fLangFlags, xFlags,
@@ -213,6 +214,7 @@ data DynFlag
    | Opt_D_dump_splices
    | Opt_D_dump_BCOs
    | Opt_D_dump_vect
+   | Opt_D_dump_avoid_vect
    | Opt_D_dump_ticked
    | Opt_D_dump_rtti
    | Opt_D_source_stats
@@ -274,7 +276,6 @@ data DynFlag
    | Opt_ForceRecomp
    | Opt_ExcessPrecision
    | Opt_EagerBlackHoling
-   | Opt_ReadUserPackageConf
    | Opt_NoHsMain
    | Opt_SplitObjs
    | Opt_StgStats
@@ -356,6 +357,7 @@ data WarningFlag =
    | Opt_WarnUnsafe
    | Opt_WarnSafe
    | Opt_WarnPointlessPragmas
+   | Opt_WarnUnsupportedCallingConventions
    deriving (Eq, Show, Enum)
 
 data Language = Haskell98 | Haskell2010
@@ -546,8 +548,8 @@ data DynFlags = DynFlags {
   depSuffixes           :: [String],
 
   --  Package flags
-  extraPkgConfs         :: [FilePath],
-        -- ^ The @-package-conf@ flags given on the command line, in the order
+  extraPkgConfs         :: [PkgConfRef] -> [PkgConfRef],
+        -- ^ The @-package-db@ flags given on the command line, in the order
         -- they appeared.
 
   packageFlags          :: [PackageFlag],
@@ -921,7 +923,7 @@ defaultDynFlags mySettings =
 
         hpcDir                  = ".hpc",
 
-        extraPkgConfs           = [],
+        extraPkgConfs           = id,
         packageFlags            = [],
         pkgDatabase             = Nothing,
         pkgState                = panic "no package state yet: call GHC.setSessionDynFlags",
@@ -1338,7 +1340,7 @@ parseDynamicFlagsCmdLine :: Monad m =>
 parseDynamicFlagsCmdLine dflags args = parseDynamicFlags dflags args True
 
 -- | Like 'parseDynamicFlagsCmdLine' but does not allow the package flags
--- (-package, -hide-package, -ignore-package, -hide-all-packages, -package-conf).
+-- (-package, -hide-package, -ignore-package, -hide-all-packages, -package-db).
 -- Used to parse flags set in a modules pragma.
 parseDynamicFilePragma :: Monad m =>
                      DynFlags -> [Located String]
@@ -1639,6 +1641,7 @@ dynamic_flags = [
   , Flag "ddump-hi"                (setDumpFlag Opt_D_dump_hi)
   , Flag "ddump-minimal-imports"   (setDumpFlag Opt_D_dump_minimal_imports)
   , Flag "ddump-vect"              (setDumpFlag Opt_D_dump_vect)
+  , Flag "ddump-avoid-vect"        (setDumpFlag Opt_D_dump_avoid_vect)
   , Flag "ddump-hpc"               (setDumpFlag Opt_D_dump_ticked) -- back compat
   , Flag "ddump-ticked"            (setDumpFlag Opt_D_dump_ticked)
   , Flag "ddump-mod-cycles"        (setDumpFlag Opt_D_dump_mod_cycles)
@@ -1752,8 +1755,13 @@ dynamic_flags = [
 package_flags :: [Flag (CmdLineP DynFlags)]
 package_flags = [
         ------- Packages ----------------------------------------------------
-    Flag "package-conf"          (HasArg extraPkgConf_)
-  , Flag "no-user-package-conf"  (NoArg (unSetDynFlag Opt_ReadUserPackageConf))
+    Flag "package-db"            (HasArg (addPkgConfRef . PkgConfFile))
+  , Flag "clear-package-db"      (NoArg clearPkgConf)
+  , Flag "no-global-package-db"  (NoArg removeGlobalPkgConf)
+  , Flag "no-user-package-db"    (NoArg removeUserPkgConf)
+  , Flag "global-package-db"     (NoArg (addPkgConfRef GlobalPkgConf))
+  , Flag "user-package-db"       (NoArg (addPkgConfRef UserPkgConf))
+
   , Flag "package-name"          (hasArg setPackageName)
   , Flag "package-id"            (HasArg exposePackageId)
   , Flag "package"               (HasArg exposePackage)
@@ -1840,7 +1848,8 @@ fWarningFlags = [
   ( "warn-alternative-layout-rule-transitional", Opt_WarnAlternativeLayoutRuleTransitional, nop ),
   ( "warn-unsafe",                      Opt_WarnUnsafe, setWarnUnsafe ),
   ( "warn-safe",                        Opt_WarnSafe, setWarnSafe ),
-  ( "warn-pointless-pragmas",           Opt_WarnPointlessPragmas, nop ) ]
+  ( "warn-pointless-pragmas",           Opt_WarnPointlessPragmas, nop ),
+  ( "warn-unsupported-calling-conventions", Opt_WarnUnsupportedCallingConventions, nop ) ]
 
 -- | These @-f\<blah\>@ flags can all be reversed with @-fno-\<blah\>@
 fFlags :: [FlagSpec DynFlag]
@@ -2062,7 +2071,6 @@ xFlags = [
 defaultFlags :: [DynFlag]
 defaultFlags
   = [ Opt_AutoLinkPackages,
-      Opt_ReadUserPackageConf,
 
       Opt_SharedImplib,
 
@@ -2172,7 +2180,8 @@ standardWarnings
         Opt_WarnDodgyForeignImports,
         Opt_WarnWrongDoBind,
         Opt_WarnAlternativeLayoutRuleTransitional,
-        Opt_WarnPointlessPragmas
+        Opt_WarnPointlessPragmas,
+        Opt_WarnUnsupportedCallingConventions
       ]
 
 minusWOpts :: [WarningFlag]
@@ -2399,8 +2408,28 @@ setVerbosity mb_n = upd (\dfs -> dfs{ verbosity = mb_n `orElse` 3 })
 addCmdlineHCInclude :: String -> DynP ()
 addCmdlineHCInclude a = upd (\s -> s{cmdlineHcIncludes =  a : cmdlineHcIncludes s})
 
-extraPkgConf_ :: FilePath -> DynP ()
-extraPkgConf_  p = upd (\s -> s{ extraPkgConfs = p : extraPkgConfs s })
+data PkgConfRef
+  = GlobalPkgConf
+  | UserPkgConf
+  | PkgConfFile FilePath
+
+addPkgConfRef :: PkgConfRef -> DynP ()
+addPkgConfRef p = upd $ \s -> s { extraPkgConfs = (p:) . extraPkgConfs s }
+
+removeUserPkgConf :: DynP ()
+removeUserPkgConf = upd $ \s -> s { extraPkgConfs = filter isNotUser . extraPkgConfs s }
+  where
+    isNotUser UserPkgConf = False
+    isNotUser _ = True
+
+removeGlobalPkgConf :: DynP ()
+removeGlobalPkgConf = upd $ \s -> s { extraPkgConfs = filter isNotGlobal . extraPkgConfs s }
+  where
+    isNotGlobal GlobalPkgConf = False
+    isNotGlobal _ = True
+
+clearPkgConf :: DynP ()
+clearPkgConf = upd $ \s -> s { extraPkgConfs = const [] }
 
 exposePackage, exposePackageId, hidePackage, ignorePackage,
         trustPackage, distrustPackage :: String -> DynP ()

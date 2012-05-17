@@ -56,8 +56,10 @@ import Id
 import MkId
 import Name
 import NameSet
+import NameEnv
 import Outputable
 import SrcLoc
+import Digraph( SCC(..) )
 import Util
 
 import Control.Monad
@@ -370,31 +372,26 @@ tcInstDecls1 tycl_decls inst_decls deriv_decls
             -- (they recover, so that we get more than one error each
             -- round)
 
-            -- (1) Do class and family instance declarations
-       ; inst_decl_stuff <- mapAndRecoverM tcLocalInstDecl1 inst_decls
+            -- Do class and family instance declarations
+       ; (gbl_env, local_infos) <- tcLocalInstDecls (calcInstDeclCycles inst_decls)
+       ; setGblEnv gbl_env $
 
-       ; let { (local_infos_s, fam_insts_s) = unzip inst_decl_stuff
-             ; all_fam_insts = concat fam_insts_s
-             ; local_infos   = concat local_infos_s }
-
-            -- (2) Next, construct the instance environment so far, consisting of
-            --   (a) local instance decls
-            --   (b) local family instance decls
-       ; addClsInsts local_infos     $
-         addFamInsts all_fam_insts   $ do
-
-            -- (3) Compute instances from "deriving" clauses;
+    do {    -- Compute instances from "deriving" clauses;
             -- This stuff computes a context for the derived instance
             -- decl, so it needs to know about all the instances possible
             -- NB: class instance declarations can contain derivings as
             --     part of associated data type declarations
-       { failIfErrsM    -- If the addInsts stuff gave any errors, don't
+         failIfErrsM    -- If the addInsts stuff gave any errors, don't
                         -- try the deriving stuff, because that may give
                         -- more errors still
 
        ; traceTc "tcDeriving" empty
+       ; th_stage <- getStage   -- See Note [Deriving inside TH brackets ]
        ; (gbl_env, deriv_inst_info, deriv_binds)
-              <- tcDeriving tycl_decls inst_decls deriv_decls
+              <- if isBrackStage th_stage 
+                 then return (gbl_env, emptyBag, emptyValBindsOut)
+                 else tcDeriving tycl_decls inst_decls deriv_decls
+
 
        -- Check that if the module is compiled with -XSafe, there are no
        -- hand written instances of Typeable as then unsafe casts could be
@@ -417,6 +414,20 @@ tcInstDecls1 tycl_decls inst_decls deriv_decls
     typInstErr = ptext $ sLit $ "Can't create hand written instances of Typeable in Safe"
                               ++ " Haskell! Can only derive them"
 
+tcLocalInstDecls :: [SCC (LInstDecl Name)] -> TcM (TcGblEnv, [InstInfo Name])
+tcLocalInstDecls [] 
+ = do { gbl_env <- getGblEnv
+      ; return (gbl_env, []) }
+tcLocalInstDecls (AcyclicSCC inst_decl : sccs)
+ = do { (inst_infos, fam_insts) <- recoverM (return ([], [])) $
+                                   tcLocalInstDecl inst_decl
+      ; (gbl_env, more_infos) <- addClsInsts inst_infos  $
+                                 addFamInsts fam_insts   $ 
+                                 tcLocalInstDecls sccs
+      ; return (gbl_env, inst_infos ++ more_infos) }
+tcLocalInstDecls (CyclicSCC inst_decls : _)
+  = do { cyclicDeclErr inst_decls; failM }
+
 addClsInsts :: [InstInfo Name] -> TcM a -> TcM a
 addClsInsts infos thing_inside
   = tcExtendLocalInstEnv (map iSpec infos) thing_inside
@@ -436,21 +447,91 @@ addFamInsts fam_insts thing_inside
     things = map ATyCon tycons ++ map ACoAxiom axioms 
 \end{code}
 
+Note [Deriving inside TH brackets]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Given a declaration bracket
+  [d| data T = A | B deriving( Show ) |]
+
+there is really no point in generating the derived code for deriving(
+Show) and then type-checking it. This will happen at the call site
+anyway, and the type check should never fail!  Moreover (Trac #6005)
+the scoping of the generated code inside the bracket does not seem to 
+work out.  
+
+The easy solution is simply not to generate the derived instances at
+all.  (A less brutal solution would be to generate them with no
+bindings.)  This will become moot when we shift to the new TH plan, so 
+the brutal solution will do.
+
+
+Note [Instance declaration cycles]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+With -XDataKinds we can get this
+   data instance Foo [a] = MkFoo (MkFoo a)
+where the constructor MkFoo is used in a type before it is
+defined.  Here is a more complicated situation, involving an 
+associated type and mutual recursion
+
+   data instance T [a] = MkT (MkS a)
+
+   instance C [a] where
+     data S [a] = MkS (MkT a)
+
+When type checking ordinary data type decls we detect this staging
+problem in the kind-inference phase, but there *is* no kind inference
+phase here.
+
+So intead we extract the strongly connected components and look for
+cycles.
+
+
 \begin{code}
-tcLocalInstDecl1 :: LInstDecl Name
-                 -> TcM ([InstInfo Name], [FamInst])
+calcInstDeclCycles :: [LInstDecl Name] -> [SCC (LInstDecl Name)]
+-- see Note [Instance declaration cycles]
+calcInstDeclCycles decls
+  = depAnal get_defs get_uses decls
+  where
+    -- get_defs extracts the *constructor* bindings of the declaration
+    get_defs :: LInstDecl Name -> [Name]
+    get_defs (L _ (FamInstD { lid_inst = fid }))       = get_fi_defs fid
+    get_defs (L _ (ClsInstD { cid_fam_insts = fids })) = concatMap (get_fi_defs . unLoc) fids
+
+    get_fi_defs :: FamInstDecl Name -> [Name]
+    get_fi_defs (FamInstDecl { fid_defn = TyData { td_cons = cons } }) 
+      = map (unLoc . con_name . unLoc) cons
+    get_fi_defs (FamInstDecl {}) = []
+
+    -- get_uses extracts the *tycon or constructor* uses of the declaration
+    get_uses :: LInstDecl Name -> [Name]
+    get_uses (L _ (FamInstD { lid_inst = fid })) = nameSetToList (fid_fvs fid)
+    get_uses (L _ (ClsInstD { cid_fam_insts = fids })) 
+        = nameSetToList (foldr (unionNameSets . fid_fvs . unLoc) emptyNameSet fids)
+
+cyclicDeclErr :: Outputable d => [Located d] -> TcRn ()
+cyclicDeclErr inst_decls
+  = setSrcSpan (getLoc (head sorted_decls)) $
+    addErr (sep [ptext (sLit "Cycle in type declarations: data constructor used (in a type) before it is defined"),
+		 nest 2 (vcat (map ppr_decl sorted_decls))])
+  where
+    sorted_decls = sortLocated inst_decls
+    ppr_decl (L loc decl) = ppr loc <> colon <+> ppr decl
+\end{code}
+
+\begin{code}
+tcLocalInstDecl :: LInstDecl Name
+                -> TcM ([InstInfo Name], [FamInst])
         -- A source-file instance declaration
         -- Type-check all the stuff before the "where"
         --
         -- We check for respectable instance type, and context
-tcLocalInstDecl1 (L loc (FamInstD decl))
+tcLocalInstDecl (L loc (FamInstD { lid_inst = decl }))
   = setSrcSpan loc      $
     tcAddFamInstCtxt decl  $
     do { fam_inst <- tcFamInstDecl TopLevel decl
        ; return ([], [fam_inst]) }
 
-tcLocalInstDecl1 (L loc (ClsInstD { cid_poly_ty = poly_ty, cid_binds = binds
-                                  , cid_sigs = uprags, cid_fam_insts = ats }))
+tcLocalInstDecl (L loc (ClsInstD { cid_poly_ty = poly_ty, cid_binds = binds
+                                 , cid_sigs = uprags, cid_fam_insts = ats }))
   = setSrcSpan loc                      $
     addErrCtxt (instDeclCtxt1 poly_ty)  $
 
@@ -759,7 +840,7 @@ tcInstDecl2 (InstInfo { iSpec = ispec, iBinds = ibinds })
              mk_sc_ev_term sc
                | null inst_tv_tys
                , null dfun_ev_vars = EvId sc
-               | otherwise         = EvDFunApp sc inst_tv_tys dfun_ev_vars
+               | otherwise         = EvDFunApp sc inst_tv_tys (map EvId dfun_ev_vars)
 
              inst_tv_tys    = mkTyVarTys inst_tyvars
              arg_wrapper = mkWpEvVarApps dfun_ev_vars <.> mkWpTyApps inst_tv_tys
@@ -1060,7 +1141,7 @@ tcInstanceMethods dfun_id clas tyvars dfun_ev_vars inst_tys
 
            ; self_dict <- newDict clas inst_tys
            ; let self_ev_bind = EvBind self_dict
-                                (EvDFunApp dfun_id (mkTyVarTys tyvars) dfun_ev_vars)
+                                (EvDFunApp dfun_id (mkTyVarTys tyvars) (map EvId dfun_ev_vars))
 
            ; (meth_id, local_meth_sig) <- mkMethIds sig_fn clas tyvars dfun_ev_vars
                                                    inst_tys sel_id

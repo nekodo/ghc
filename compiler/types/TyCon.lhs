@@ -22,7 +22,6 @@ module TyCon(
         -- ** Constructing TyCons
         mkAlgTyCon,
         mkClassTyCon,
-        mkIParamTyCon,
         mkFunTyCon,
         mkPrimTyCon,
         mkKindTyCon,
@@ -859,11 +858,6 @@ mkClassTyCon :: Name -> Kind -> [TyVar] -> AlgTyConRhs -> Class -> RecFlag -> Ty
 mkClassTyCon name kind tyvars rhs clas is_rec =
   mkAlgTyCon name kind tyvars Nothing [] rhs (ClassTyCon clas) is_rec False
 
--- | Simpler specialization of 'mkAlgTyCon' for implicit paramaters
-mkIParamTyCon :: Name -> Kind -> TyVar -> AlgTyConRhs -> RecFlag -> TyCon
-mkIParamTyCon name kind tyvar rhs is_rec =
-  mkAlgTyCon name kind [tyvar] Nothing [] rhs NoParentTyCon is_rec False
-
 mkTupleTyCon :: Name
              -> Kind    -- ^ Kind of the resulting 'TyCon'
              -> Arity   -- ^ Arity of the tuple
@@ -1482,9 +1476,10 @@ instance Outputable TyCon where
 
 pprPromotionQuote :: TyCon -> SDoc
 pprPromotionQuote (PromotedDataCon {}) = char '\''   -- Quote promoted DataCons in types
+pprPromotionQuote (PromotedTyCon {})   = ifPprDebug (char '\'') 
 pprPromotionQuote _                    = empty       -- However, we don't quote TyCons in kinds
                                                      -- e.g.   type family T a :: Bool -> *
-                                                     -- cf Trac #5952
+                                                     -- cf Trac #5952.  Except with -dppr-debug
 
 instance NamedThing TyCon where
     getName = tyConName
