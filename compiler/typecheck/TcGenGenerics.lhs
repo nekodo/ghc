@@ -404,7 +404,7 @@ tc_mkRepFamInsts gk tycon metaDts mod =
          Gen1 -> tcLookupTyCon rep1TyConName
 
      ; let -- `tyvars` = [a,b]
-           tyvars     = (case gk of Gen0 -> id; Gen1 -> init) tyConTyVars tycon
+           tyvars     = (case gk of Gen0 -> id; Gen1 -> init) (tyConTyVars tycon)
            tyvar_args = mkTyVarTys tyvars
 
            -- `appT` = D a b
